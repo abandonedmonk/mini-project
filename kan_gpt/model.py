@@ -5,7 +5,8 @@ References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
 https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+https://github.com/huggingface/transformers/blob/main/src/transformers\
+/models/gpt2/modeling_gpt2.py
 """
 
 import math
@@ -14,15 +15,20 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from mingpt.utils import CfgNode as CN
+from kan_gpt.efficient_kan.model import KAN as EFFICIENT_KAN
+from kan_gpt.kan.KAN import KAN as ORIGINAL_KAN
+from kan_gpt.mingpt.utils import CfgNode as CN
+from kan_gpt.settings import settings
 
 # -----------------------------------------------------------------------------
 
 
 class NewGELU(nn.Module):
     """
-    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
-    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    Implementation of the GELU activation function currently in Google BERT
+    repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper:
+    https://arxiv.org/abs/1606.08415
     """
 
     def forward(self, x):
@@ -41,22 +47,27 @@ class NewGELU(nn.Module):
 
 class CausalSelfAttention(nn.Module):
     """
-    A vanilla multi-head masked self-attention layer with a projection at the end.
-    It is possible to use torch.nn.MultiheadAttention here but I am including an
-    explicit implementation here to show that there is nothing too scary here.
+    A vanilla multi-head masked self-attention layer with a projection at
+    the end. It is possible to use torch.nn.MultiheadAttention here but I am
+    including an explicit implementation here to show that there is nothing
+    too scary here.
     """
 
     def __init__(self, config):
         super().__init__()
+        self.kan_implementation = config.kan_implementation
+        KAN = self.get_KAN()
+
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = KAN(width=[config.n_embd, 3 * config.n_embd])
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = KAN(width=[config.n_embd, config.n_embd])
         # regularization
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
+        # causal mask to ensure that attention is only applied to the left in
+        # the input sequence
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.block_size, config.block_size)).view(
@@ -66,12 +77,23 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
+    def get_KAN(self):
+        if self.kan_implementation == "EFFICIENT_KAN":
+            KAN = EFFICIENT_KAN  # type: ignore
+        elif self.kan_implementation == "ORIGINAL_KAN":
+            KAN = ORIGINAL_KAN  # type: ignore
+        else:
+            raise NotImplementedError()
+
+        return KAN
+
     def forward(self, x):
         B, T, C = (
             x.size()
         )  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # calculate query, key, values for all heads in batch and move head
+        # forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(
             1, 2
@@ -83,7 +105,8 @@ class CausalSelfAttention(nn.Module):
             1, 2
         )  # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # causal self-attention;
+        # Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
@@ -103,13 +126,15 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.kan_implementation = config.kan_implementation
+        KAN = self.get_KAN()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = nn.ModuleDict(
             dict(
-                c_fc=nn.Linear(config.n_embd, 4 * config.n_embd),
-                c_proj=nn.Linear(4 * config.n_embd, config.n_embd),
+                c_fc=KAN(width=[config.n_embd, 4 * config.n_embd]),
+                c_proj=KAN(width=[4 * config.n_embd, config.n_embd]),
                 act=NewGELU(),
                 dropout=nn.Dropout(config.resid_pdrop),
             )
@@ -118,6 +143,14 @@ class Block(nn.Module):
         self.mlpf = lambda x: m.dropout(
             m.c_proj(m.act(m.c_fc(x)))
         )  # MLP forward
+
+    def get_KAN(self):
+        if self.kan_implementation == "EFFICIENT_KAN":
+            KAN = EFFICIENT_KAN  # type: ignore
+        elif self.kan_implementation == "ORIGINAL_KAN":
+            KAN = ORIGINAL_KAN  # type: ignore
+
+        return KAN
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -131,7 +164,8 @@ class GPT(nn.Module):
     @staticmethod
     def get_default_config():
         C = CN()
-        # either model_type or (n_layer, n_head, n_embd) must be given in the config
+        # either model_type or (n_layer, n_head, n_embd)
+        # must be given in the config
         C.model_type = "gpt"
         C.n_layer = None
         C.n_head = None
@@ -143,6 +177,9 @@ class GPT(nn.Module):
         C.embd_pdrop = 0.1
         C.resid_pdrop = 0.1
         C.attn_pdrop = 0.1
+        C.attn_pdrop = 0.1
+        # KAN Implementation
+        C.kan_implementation = settings.kan.KAN_IMPLEMENTATION
         return C
 
     def __init__(self, config):
@@ -150,6 +187,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
+        self.kan_implementation = config.kan_implementation
 
         type_given = config.model_type is not None
         params_given = all(
@@ -204,9 +242,13 @@ class GPT(nn.Module):
                 ln_f=nn.LayerNorm(config.n_embd),
             )
         )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        KAN = self.get_KAN()
+        self.lm_head = KAN(
+            width=[config.n_embd, config.vocab_size], bias_trainable=False
+        )
 
-        # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
+        # init all weights, and apply a special scaled init to the residual
+        # projections, per GPT-2 paper
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
@@ -214,15 +256,83 @@ class GPT(nn.Module):
                     p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
                 )
 
-        # report number of parameters (note we don't count the decoder parameters in lm_head)
+        # report number of parameters (note we don't count the decoder
+        # parameters in lm_head)
         n_params = sum(p.numel() for p in self.transformer.parameters())
         print("number of parameters: %.2fM" % (n_params / 1e6,))
 
+    def get_KAN(self):
+        if self.kan_implementation == "EFFICIENT_KAN":
+            KAN = EFFICIENT_KAN  # type: ignore
+        elif self.kan_implementation == "ORIGINAL_KAN":
+            KAN = ORIGINAL_KAN  # type: ignore
+
+        return KAN
+
+    def kan_loss(
+        self,
+        x: torch.Tensor,
+        lamb_l1=1.0,
+        lamb_entropy=2.0,
+        lamb_coef=0.0,
+        lamb_coefdiff=0.0,
+        small_mag_threshold=1e-16,
+        small_reg_factor=1.0,
+    ):
+
+        def reg(mod):
+
+            def nonlinear(x, th=small_mag_threshold, factor=small_reg_factor):
+                return (x < th) * x * factor + (x > th) * (
+                    x + (factor - 1) * th
+                )
+
+            reg_ = 0.0
+            for i in range(len(mod.acts_scale)):
+                vec = mod.acts_scale[i].reshape(
+                    -1,
+                )
+
+                p = vec / torch.sum(vec)
+                l1 = torch.sum(nonlinear(vec))
+                entropy = -torch.sum(p * torch.log2(p + 1e-4))
+                reg_ += (
+                    lamb_l1 * l1 + lamb_entropy * entropy
+                )  # both l1 and entropy
+
+            # regularize coefficient to encourage spline to be zero
+            for i in range(len(mod.act_fun)):
+                coeff_l1 = torch.sum(
+                    torch.mean(torch.abs(mod.act_fun[i].coef), dim=1)
+                )
+                coeff_diff_l1 = torch.sum(
+                    torch.mean(
+                        torch.abs(torch.diff(mod.act_fun[i].coef)), dim=1
+                    )
+                )
+                reg_ += lamb_coef * coeff_l1 + lamb_coefdiff * coeff_diff_l1
+
+            return reg_
+
+        total_reg = torch.tensor(0.0).to(device=x.device, dtype=torch.float32)
+        size = 0
+        KAN = self.get_KAN()
+        for mod in self.modules():
+            if isinstance(mod, KAN):
+                total_reg += reg(mod)
+                size += 1
+
+        mean_reg = total_reg / size
+        return mean_reg
+
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+        KAN = self.get_KAN()
+        if isinstance(module, KAN):
+            # torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # if module.bias is not None:
+            #     torch.nn.init.zeros_(module.bias)
+            # TODO: init weights
+            pass
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
@@ -250,7 +360,8 @@ class GPT(nn.Module):
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        # copy while ensuring all of the parameters are aligned and
+        # match in names and shapes
         keys = [
             k for k in sd_hf if not k.endswith("attn.masked_bias")
         ]  # ignore these
@@ -260,8 +371,9 @@ class GPT(nn.Module):
             "mlp.c_fc.weight",
             "mlp.c_proj.weight",
         ]
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla nn.Linear.
-        # this means that we have to transpose these weights when we import them
+        # basically the openai checkpoints use a "Conv1D" module, but we only
+        # want to use a vanilla nn.Linear. this means that we have to
+        # transpose these weights when we import them
         assert len(keys) == len(sd)
         for k in keys:
             if any(k.endswith(w) for w in transposed):
@@ -279,29 +391,31 @@ class GPT(nn.Module):
 
     def configure_optimizers(self, train_config):
         """
-        This long function is unfortunately doing something very simple and is being very defensive:
-        We are separating out all parameters of the model into two buckets: those that will experience
-        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
-        We are then returning the PyTorch optimizer object.
+        This long function is unfortunately doing something very simple and
+        is being very defensive: We are separating out all parameters of the
+        model into two buckets: those that will experience weight decay for
+        regularization and those that won't (biases, and layernorm/embedding
+        weights). We are then returning the PyTorch optimizer object.
         """
 
-        # separate out all parameters to those that will and won't experience regularizing weight decay
+        # separate out all parameters to those that will and won't experience
+        # regularizing weight decay
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear,)
+        KAN = self.get_KAN()
+        whitelist_weight_modules = (KAN,)
         blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
-                # random note: because named_modules and named_parameters are recursive
-                # we will see the same tensors p many many times. but doing it this way
-                # allows us to know which parent module any tensor p belongs to...
+                # random note: because named_modules and named_parameters
+                # are recursive we will see the same tensors p many many
+                # times. but doing it this way allows us to know which
+                # parent module any tensor p belongs to...
                 if pn.endswith("bias"):
                     # all biases will not be decayed
                     no_decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(
-                    m, whitelist_weight_modules
-                ):
+                elif isinstance(m, whitelist_weight_modules):
                     # weights of whitelist modules will be weight decayed
                     decay.add(fpn)
                 elif pn.endswith("weight") and isinstance(
@@ -342,12 +456,24 @@ class GPT(nn.Module):
         )
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        lamb=0.01,
+        lamb_l1=1.0,
+        lamb_entropy=2.0,
+        lamb_coef=0.0,
+        lamb_coefdiff=0.0,
+        small_mag_threshold=1e-16,
+        small_reg_factor=1.0,
+    ):
         device = idx.device
         b, t = idx.size()
-        assert (
-            t <= self.block_size
-        ), f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
+        assert t <= self.block_size, (
+            f"Cannot forward sequence of length {t}, "
+            f"block size is only {self.block_size}"
+        )
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(
             0
         )  # shape (1, t)
@@ -374,6 +500,18 @@ class GPT(nn.Module):
                 ignore_index=-1,
             )
 
+            if settings.kan.KAN_IMPLEMENTATION == "ORIGINAL_KAN":
+                reg = self.kan_loss(
+                    x=idx,
+                    lamb_l1=lamb_l1,
+                    lamb_entropy=lamb_entropy,
+                    lamb_coef=lamb_coef,
+                    lamb_coefdiff=lamb_coefdiff,
+                    small_mag_threshold=small_mag_threshold,
+                    small_reg_factor=small_reg_factor,
+                )
+                loss = loss + lamb * reg
+
         return logits, loss
 
     @torch.no_grad()
@@ -381,20 +519,24 @@ class GPT(nn.Module):
         self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None
     ):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Take a conditioning sequence of indices idx (LongTensor of shape
+        (b,t)) and complete the sequence max_new_tokens times, feeding the
+        predictions back into the model each time. Most likely you'll want
+        to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
+            # if the sequence context is growing too long we must crop it at
+            # block_size
             idx_cond = (
                 idx
                 if idx.size(1) <= self.block_size
-                else idx[:, -self.block_size:]
+                else idx[:, -self.block_size :]
             )
-            # forward the model to get the logits for the index in the sequence
+            # forward the model to get the logits for the index in the
+            # sequence
             logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+            # pluck the logits at the final step and scale by desired
+            # temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
@@ -402,7 +544,8 @@ class GPT(nn.Module):
                 logits[logits < v[:, [-1]]] = -float("Inf")
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            # either sample from the distribution or take the most likely element
+            # either sample from the distribution or take the most likely
+            # element
             if do_sample:
                 idx_next = torch.multinomial(probs, num_samples=1)
             else:
@@ -423,6 +566,10 @@ if __name__ == "__main__":
 
     x = torch.zeros((1, 10), dtype=torch.long)
     y = torch.zeros((1, 10), dtype=torch.long)
+
+    # x = x.cuda()
+    # y = y.cuda()
+    # model = model.cuda()
 
     logits, loss = model(x, y)
 

@@ -3,8 +3,8 @@ import os
 import torch
 from transformers import GPT2Tokenizer
 
-from mingpt.model import GPT as MLP_GPT
-from model import GPT as KAN_GPT
+from kan_gpt.mingpt.model import GPT as MLP_GPT
+from kan_gpt.model import GPT as KAN_GPT
 
 
 @torch.no_grad()
@@ -12,11 +12,10 @@ def main(args):
 
     model_type = args.model_type
 
-    # if args.architecture == "KAN":
-    #     GPT = KAN_GPT
-    # else:
-    #     GPT = MLP_GPT
-    GPT = KAN_GPT
+    if args.architecture == "KAN":
+        GPT = KAN_GPT
+    else:
+        GPT = MLP_GPT
 
     # create a GPT instance
     model_config = GPT.get_default_config()
@@ -60,9 +59,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt", default="Out of thy sleep. What is it thou didst say?"
     )
-    # parser.add_argument(
-    #     "--architecture", choices=["MLP", "KAN"], default="KAN"
-    # )
+    parser.add_argument(
+        "--architecture", choices=["MLP", "KAN"], default="KAN"
+    )
     parser.add_argument(
         "--device", choices=["auto", "cpu", "cuda"], default="auto"
     )
